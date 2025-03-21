@@ -1,0 +1,824 @@
+---
+title: "HW10"
+author: "Ella"
+date: "2025-03-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readr)
+library(ggplot2)
+library(tidycensus)
+library(scales)
+library("viridis")
+library(mapview)
+
+library(tigris) 
+library(sf)
+
+
+#load color pallet
+my_orange <- '#f4a259'
+my_green <- '#8cb369'
+my_red <- '#bc4b51'
+
+
+#census_api_key("94876cbef2bc77b179dc9c30c2f620b9bc55596f", install = TRUE)
+```
+
+## Data Cleaning
+
+```{r}
+
+#get general data
+pums_data <- get_pums(variables = c("HHT2", "HUPAOC", "HINCP", "TEN", "NP", "NOC",
+                "CIT", "FER", "SERIALNO", "GRPIP", "MHP", "FINCP", "MRGP", "HHT", "OCPIP"),
+                      state = "MN",
+                      survey = "acs1",
+                      year = 2023)
+
+
+write_csv(pums_data, "mn_pums_var.csv")
+
+varData <- read.csv("mn_pums_var.csv")
+
+```
+
+```{r}
+
+#filter to just single-parent households
+data_filtered <- varData %>%
+   filter(HHT2 %in% c("06", "10"), HUPAOC != "4")
+
+data_filtered %>% group_by(SERIALNO) %>%
+  slice(1) %>%
+  ungroup()
+
+
+#filter to just owners and renters
+data_filtered <- data_filtered %>%
+mutate(TEN_BINARY = case_when(
+           TEN == "1" ~ "Owner",
+           TEN == "3" ~ "Renter",
+           TEN == "2" ~ "OwnedFree",
+           TEN == "4" ~ "Occupied",
+         )) %>%
+  filter(TEN %in% c("1", "3"))  
+
+       
+#compute housing cost
+data_filtered <- data_filtered %>%
+  filter(!is.na(TEN_BINARY)) %>% 
+  filter(GRPIP != "bbb") %>%
+  mutate(housing_cost = case_when(
+    TEN_BINARY == "Owner" ~ OCPIP/100,
+    TEN_BINARY == "Renter" ~ GRPIP/100
+  ))
+
+data_filtered <- data_filtered %>%
+  mutate(TEN_BINARY = as.factor(TEN_BINARY))
+
+
+#remove infinite numbers
+data_filtered <- data_filtered %>%
+  filter(is.finite(housing_cost) & !is.na(housing_cost))
+
+#remove crazy incomes
+data_filtered <- data_filtered %>%
+   filter(HINCP <= 300000)
+
+#filter out unknown values of FER
+data_filtered <- data_filtered %>%
+filter(FER != "b") %>%
+  mutate(FER = as.factor(FER))
+
+#compute cost burden status of households
+data_filtered <- data_filtered %>%
+  mutate(severe_cost_burdened = case_when(
+    housing_cost > 0.50 ~ 2,
+    housing_cost >= 0.30 & housing_cost <= 0.50 ~ 1,
+    TRUE ~ 0 
+  )) %>%
+  mutate(cost_burdened = if_else(housing_cost > 0.30, 1, 0))
+
+
+# add binary citizenship flag
+data_filtered <- data_filtered %>%
+  mutate(CIT_BINARY= if_else(CIT %in% c("1", "2", "3", "4"), 1, 0)) %>%
+  mutate(CIT_BINARY = as.factor(CIT_BINARY))
+
+#remove weights and add rows
+data_filtered <- data_filtered %>%
+  uncount(PWGTP)
+
+#write csv file
+write_csv(data_filtered, "mn_pums_cleaned.csv")
+
+#reload csv file for use
+cleanData <- read.csv("mn_pums_cleaned.csv")
+
+```
+
+## Exploration of variable on interest
+
+```{r}
+
+# numerical summary of cost burden status
+count_values <- table(cleanData$cost_burdened)
+
+proportion_values <- prop.table(count_values) * 100
+mean_value <- mean(cleanData$cost_burdened, na.rm = TRUE)
+std_dev <- sd(cleanData$cost_burdened, na.rm = TRUE)
+
+cat("Count of Cost Burdened (0 and 1):\n")
+print(count_values)
+cat("\nProportion of Cost Burdened (Percentage):\n")
+print(proportion_values)
+cat("\nMean Cost Burdened (Proportion of 1s):", mean_value, "\n")
+cat("Standard Deviation of Cost Burdened:", std_dev, "\n")
+
+
+# define ACS variables for cost-burdened renters and homeowners
+acs_vars <- c(
+  "B25070_007",  # renters paying 30-34.9% of income on rent
+  "B25070_008",  # renters paying 35-39.9% of income on rent
+  "B25070_009",  # renters paying 40-49.9% of income on rent
+  "B25070_010",  # renters paying >50% of income on rent
+  "B25091_010",  # owners paying 30-34.9% of income on housing
+  "B25091_011",  # owners paying 35-39.9% of income on housing
+  "B25091_006",  # owners paying 40-49.9% of income on housing
+  "B25091_007"   # owners paying >50% of income on housing
+)
+
+# getting ACS data for Minnesota counties 2023,  get_acs is used because it provides the geographic boundaries, so it's easier to create maps using ggplot
+mn_acs <- get_acs(
+  geography = "county",
+  variables = acs_vars,
+  state = "MN",
+  year = 2023,
+  survey = "acs5",
+  geometry = TRUE
+)
+
+# make data wide for graphing
+mn_acs_wide <- mn_acs %>%
+  select(GEOID, NAME, variable, estimate, geometry) %>%
+  pivot_wider(names_from = variable, values_from = estimate)
+
+# calculate total cost-burdened households (renters + homeowners)
+mn_acs_wide <- mn_acs_wide %>%
+  mutate(
+    total_cost_burdened = B25070_007 + B25070_008 + B25070_009 + B25070_010 +
+                          B25091_010 + B25091_011 + B25091_006 + B25091_007
+  )
+
+# I couldn't see any contrast because my fill scale had values at such a large scale, so I squished it to see more differences between counties
+# I removed the top and bottom quantiles to cut off major outliers
+min_val_total <- quantile(mn_acs_wide$total_cost_burdened, 0.07, na.rm = TRUE)
+max_val_total <- quantile(mn_acs_wide$total_cost_burdened, 0.93, na.rm = TRUE)
+
+# map of total cost-burdened households by county in Minnesota
+ggplot(mn_acs_wide) +
+  geom_sf(aes(fill = total_cost_burdened), color = "white", size = 0.2) +
+  scale_fill_gradientn(
+    colors = c(my_green, my_orange, my_red),
+    limits = c(min_val_total, max_val_total),
+    oob = scales::squish, # keep outliers as values and not NA
+    labels = scales::comma
+  ) +
+  labs(
+    title = "Total Cost-Burdened Households by County in Minnesota",
+    fill = "Total Cost-Burdened Households"
+  )
+
+
+
+```
+
+## One Variable Models
+
+#### Household Income vs. Cost-Burdened Status
+
+```{r}
+
+# histogram of household income vs. cost burdened status
+ggplot(cleanData, aes(x = HINCP, fill = as.factor(cost_burdened))) +   
+  geom_histogram(color = "black", bins = 15) +   
+  labs(title = "Household Income vs. Cost-Burdened Status",
+       x = "Household Income",
+       y = "Count",
+       fill = "Cost-Burdened Status") +
+  scale_fill_manual(values = c("0" = my_green, "1" = my_red),  
+                    labels = c("0" = "Not Cost-Burdened", "1" = "Cost-Burdened")) +
+  scale_x_continuous(labels = comma)
+
+
+# histogram of household income vs. expanded cost burdened status
+ggplot(cleanData, aes(x = HINCP, fill = as.factor(severe_cost_burdened))) +   
+  geom_histogram(color = "black", bins = 15) +   
+  labs(title = "Household Income vs. Cost-Burdened Status ",
+       x = "Household Income",
+       y = "Count",
+       fill = "Cost-Burdened Status") +
+  scale_fill_manual(values = c("0" = my_green, "1" = my_orange, "2" = my_red),  
+                    labels = c("0" = "Not Cost-Burdened", "1" = "Cost-Burdened", "2" = "Severely Cost-Burdened")) +
+  scale_x_continuous(labels = comma)
+
+
+# scatter plot with model displayed
+ggplot(cleanData, aes(x = HINCP, y = housing_cost)) +
+  geom_point(alpha = 0.5, color = my_green) +
+  geom_smooth(method = "lm", color = my_red) +
+  scale_x_continuous(labels = scales::comma) +
+  labs(title = "% Income Spent on Housing vs. Household Income",
+       x = "Household Income",
+       y = "% Income Spent on Housing")
+
+
+# model with HINCP predictor
+income_model <- glm(cost_burdened ~ HINCP, data = cleanData)
+summary(income_model)
+
+```
+
+Household income was chosen as a factor in understanding housing affordability because it can represent the financial resources available to a household. Given that housing costs are often a fixed or semi-fixed expense, households with lower incomes are more vulnerable to experiencing cost burden. The histogram of household income reveals a strong right skew, with most cost-burdened households concentrated on the lower end of the income scale. This suggests that lower-income households are more likely to struggle with housing costs.  A general linear model also shows a strong negative relationship between income and cost-burden status. There is a clear downward trend in cost burden as income increases indicate that financial strain is most severe among households with lower income.
+ 
+
+#### Tenure vs. Cost-Burdened Status
+
+```{r}
+# bar plot of tenure vs. cost burdened status
+ggplot(cleanData, aes(x = TEN_BINARY, fill = as.factor(severe_cost_burdened))) + 
+  geom_bar(position = "fill", color = "black") + 
+  labs(title = "Tenure vs. Cost-Burdened Status",
+       x = "Housing Tenure",
+       y = "Proportion",
+       fill = "Cost-Burdened Status") + 
+  scale_fill_manual(values = c("0" = my_green, "1" = my_orange, "2" = my_red),
+                    labels = c("0" = "Not Cost-Burdened", "1" = "Cost-Burdened", "2" = "Severely Cost-Burdened"))
+
+# box plot of housing cost as a percentage of income by tenure
+ggplot(cleanData, aes(x = TEN_BINARY, y = housing_cost, fill = TEN_BINARY)) + 
+  geom_boxplot() + 
+  labs(title = "Housing Cost as % of Income by Housing Tenure",
+       x = "Housing Tenure",
+       y = "% of Income Spent on Housing") + 
+  scale_fill_manual(values = c("Owner" = my_green, "Renter" = my_orange)) 
+
+# model with TEN_BINARY predictor
+tenure_model <- glm(cost_burdened ~ TEN_BINARY, data = cleanData, family = "binomial")
+summary(tenure_model)
+
+# get odds ratios from model coefficients
+odds_ratio_tenure <- exp(0.273554) 
+
+cat("Odds Ratio for Renters (vs. Homeowners):", odds_ratio_tenure, "\n")
+
+
+```
+
+Housing tenure was selected as a factor in understanding cost burden because it could reflect the differences in financial obligations between homeowners and renters. Renters typically face more variable and often rising housing costs, while homeowners may have more stable payments, especially if they have fixed-rate mortgages. A box plot of tenure shows that the  renters typically spend a higher percentage of their income on housing.  A bar plot shows that there are nearly even proportions of cost-burdened households in both populations, however renters have a higher proportion of severely cost-burdened households.  A logistic regression model confirms this, indicating that renters are 31.5% more likely to be cost-burdened relative to homeowners. 
+
+
+#### Number of People in Household vs. Cost-Burdened Status
+
+```{r}
+
+#histogram of cost_burdened proportions
+ggplot(cleanData, aes(x = NP, fill = as.factor(cost_burdened))) +   
+  geom_histogram(color = "black", bins = 10) +   
+  labs(title = "Number of People in Household vs. Cost Burdened Status",
+       x = "Number of People in Household",
+       y = "Count",
+       fill = "Cost-Burdened Status") +
+  scale_fill_manual(values = c("0" = my_green, "1" = my_red),  
+                    labels = c("0" = "Not Cost-Burdened", "1" = "Cost-Burdened"))  
+
+
+#histogram of expanded cost_burdened proportions
+ggplot(cleanData, aes(x = NP, fill = as.factor(severe_cost_burdened))) +   
+  geom_histogram(color = "black", bins = 10) +   
+  labs(title = "Number of People in Household vs. Expanded Cost-Burdened Status",
+       x = "Number of People in Household",
+       y = "Count",
+       fill = "Cost-Burdened Status") +
+  scale_fill_manual(values = c("0" = my_green, "1" = my_orange, "2" = my_red),  
+                    labels = c("0" = "Not Cost-Burdened", "1" = "Cost-Burdened", "2"= "Severely Cost-Burdened"))  
+
+#scatterplot of housing costs vs. household size 
+ggplot(cleanData, aes(x = NP, y = housing_cost)) +
+  geom_point(alpha = 0.5, color = my_green) +
+  geom_smooth(method = "lm", color = my_red) +
+  labs(title = "% Income Spent on Housing vs. Household Size\n",
+       x = "Number of People in Household",
+       y = "% Income Spent on Housing")
+
+# model with NP predictor
+np_model <- lm(housing_cost ~ NP, data = cleanData)
+summary(np_model)
+
+
+
+# get odds ratios from model coefficients
+odds_ratio_NP <- exp(-0.0143218) 
+
+cat("Odds Ratio for NP:", odds_ratio_NP, "\n")
+
+
+
+```
+
+Household size was selected as a factor to influence cost burden because the number of people in a household affects both income sources and living expenses. Larger households may have multiple earners contributing to income, but they also have higher overall living costs. The histogram of household size indicates that cost burden is more common among smaller households, particularly single-person and two-person households. A linear model shows a very small negative trend between household size and housing cost, with each additional household member being associated with a 1.5% decrease in housing cost.
+
+
+#### Birth of a Child in the Past 12 Months vs. Cost-Burdened Status
+
+```{r}
+
+
+# bar plot of birth of a child in the past 12 months vs cost burden
+ggplot(cleanData, 
+       aes(x = as.factor(FER), fill = as.factor(severe_cost_burdened))) +
+  geom_bar(position = "fill", color = "black") +
+  labs(
+    title = "Recent Birth of a Child vs. Cost-Burdened Status",
+    x = "Birth of Child in the Past 12 Months",
+    y = "Proportion",
+    fill = "Cost-Burdened Status"
+  ) +
+  scale_x_discrete(labels = c("1" = "Yes", "2" = "No")) + 
+  scale_fill_manual(
+    values = c("0" = my_green, "1" = my_orange, "2" = my_red),
+    labels = c("0" = "Not Cost-Burdened", "1" = "Cost-Burdened", "2" = "Severely Cost-Burdened")
+  )
+
+# box plot of housing costs vs. recent birth of a child
+ggplot(cleanData,       
+       aes(x = as.factor(FER), y = housing_cost, fill = as.factor(FER))) +    
+  geom_boxplot() +    
+  labs(title = "Housing Cost as % of Income and Recent Birth of a Child",
+       x = "Birth of Child in the Past 12 Months",
+       y = "% of Income Spent on Housing",
+       fill = "Recent Birth of a Child") +
+  scale_x_discrete(labels = c("1" = "Yes", "2" = "No")) +     
+  scale_fill_manual(     
+    values = c("1" = my_green, "2" = my_orange),      
+    labels = c("1" = "Yes", "2" = "No")   
+  ) +
+ theme(legend.position = "none")
+
+# model with FER predictor
+fer_model <- glm(cost_burdened ~ FER, data = cleanData, family = "binomial")
+summary(fer_model)
+
+# get odds ratios from model coefficients
+odds_ratio_FER <- exp( 0.15392) 
+
+cat("Odds Ratio for FER:", odds_ratio_FER, "\n")
+
+
+```
+
+The birth of a child in the past 12 months was analyzed as a potential factor influencing cost burden, as new parents may have new childcare costs and medical expenses. The bar plot reveals that there is a higher proportion of cost-burdened households among those who had a child in the past 12 months compared to those that did not. A logistic regression model confirms this trend, revealing that households with a recent birth are 16.6% more likely to be cost-burdened compared to those without a recent birth.
+
+
+
+#### Citizenship vs. Cost-Burdened Status
+
+```{r}
+
+# bar plot of citizenship vs. cost-burdened status
+ggplot(cleanData, aes(x = as.factor(CIT_BINARY), fill = as.factor(cost_burdened))) + 
+  geom_bar(position = "fill", color = "black") + 
+  labs(title = "Citizenship vs. Cost-Burdened Status",
+       x = "Citizenship",
+       y = "Proportion",
+       fill = "Cost-Burdened Status") + 
+  scale_x_discrete(labels = c("0" = "Non-Citizen", "1" = "Citizen")) + 
+  scale_fill_manual(values = c("0" = my_green, "1" = my_red),
+                    labels = c("0" = "Not Cost-Burdened", "1" = "Cost-Burdened")) 
+
+# bar plot of citizenship vs. expanded cost-burdened status
+ggplot(cleanData, aes(x = as.factor(CIT_BINARY), fill = as.factor(severe_cost_burdened))) + 
+  geom_bar(position = "fill", color = "black") + 
+  labs(title = "Citizenship vs. Expanded Cost-Burdened Status",
+       x = "Citizenship",
+       y = "Proportion",
+       fill = "Cost-Burdened Status") + 
+  scale_x_discrete(labels = c("0" = "Non-Citizen", "1" = "Citizen")) + 
+  scale_fill_manual(values = c("0" = my_green, "1" = my_orange, "2" = my_red),
+                    labels = c("0" = "Not Cost-Burdened", "1" = "Cost-Burdened", "2" = "Severely Cost-Burdened")) 
+
+# box plot of housing cost of housing costs by citizenship status
+ggplot(cleanData, aes(x = as.factor(CIT_BINARY), y = housing_cost, fill = as.factor(CIT_BINARY))) + 
+  geom_boxplot() + 
+  labs(title = "Housing Cost as % of Income by Citizenship Status",
+       x = "Citizenship",
+       y = "% of Income Spent on Housing") + 
+  scale_x_discrete(labels = c("0" = "Non-Citizen", "1" = "Citizen")) + 
+  scale_fill_manual(values = c("0" = my_green, "1" = my_orange)) +
+   theme(legend.position = "none")
+
+# model for citizenship
+citizenship_model <- glm(cost_burdened ~ CIT_BINARY, data = cleanData, family = "binomial")
+summary(citizenship_model)
+
+# get odds ratios from model coefficients
+odds_ratio_CIT <- exp( 0.88192) 
+
+cat("Odds Ratio for CIT:", odds_ratio_CIT, "\n")
+
+
+```
+
+Citizenship status was analyzed as a potential factor in housing affordability, as non-citizen households may face additional economic challenges such as employment restrictions or limited access to financial assistance. However, a bar plot and box plot comparing the two groups reveals that a larger proportion of citizens fall into the cost-burdened or severely cost-burdened categories. A logistic regression model reveals that citizen households are about 141.5%. more likely to be cost-burdened than non-citizens.
+
+
+## Multivariate Models
+
+#### Income and Tenure Model
+
+```{r}
+
+# model with HINCP and TED_BINARY predictors
+income_tenure_model <- glm(cost_burdened ~ HINCP + TEN_BINARY, data = cleanData, family = "binomial")
+summary(income_tenure_model)
+
+
+#plot of household income and probability of being cost burdened, grouped by tenure
+ggplot(cleanData, aes(x = HINCP, y = cost_burdened, color = TEN_BINARY)) + 
+  geom_point(alpha = 0.3) + 
+  geom_smooth(method = "glm", method.args = list(family = "binomial")) + 
+  scale_x_continuous(labels = scales::comma) + 
+  labs(title = "Cost-Burden Probability by Income & Tenure",
+       x = "Household Income",
+       y = "Probability of Being Cost-Burdened",
+       color = "Tenure") + 
+  scale_color_manual(values = c("Owner" = my_green, "Renter" = my_orange))
+
+# get odds ratios from model coefficients
+odds_ratio_tenure <- exp(-8.671e-01) 
+
+cat("Odds Ratio for Renters (vs. Homeowners):", odds_ratio_tenure, "\n")
+
+#  effect of a $10,000 increase in income
+odds_ratio_10k <- exp(-4.565e-05 * 10000)
+cat("Odds Ratio for a $10,000 increase in Income:", odds_ratio_10k, "\n")
+
+
+
+```
+
+This model examines how household income and housing tenure (owner vs. renter) impact the likelihood of being cost burdened. Since we established earlier that renters typically face higher housing cost burdens than homeowners, we expect tenure to play a key role. However, the visualization shows that owners have a significantly higher probability of being cost burdened across all income levels. The model reveals that renters are only 42% as likely to be cost-burdened as homeowners, after controlling for income. Among both tenure groups, higher-income households are significantly less likely to be cost-burdened, with a household earning $10,000 more being 36% less likely to be cost-burdened.
+
+Initially, the single-variable model suggested renters are 31.5% more likely to be cost-burdened, but the multivariate model revealed renters are only 42% as likely to be cost-burdened at the same income level. This can be known as Simpson’s Paradox. This shift happened because renters, on average, have lower incomes than homeowners. Lower-income households are generally more likely to be cost-burdened. However, within the same income level, homeowners may face higher cost burdens due to mortgages, property taxes, and maintenance costs. The single-variable model failed to account for income differences, which made it look like renters were more cost-burdened. Once income was controlled for, the model revealed that homeowners actually had higher cost burdens at the same income level.
+
+
+#### Income, Tenure and Citizenship Model
+
+```{r}
+
+# model with HINCP and TED_BINARY interaction term with CIT_BINARY 
+income_tenure_cit_model <- glm(cost_burdened ~ HINCP + TEN_BINARY + HINCP:TEN_BINARY + CIT_BINARY, data = cleanData, family = "binomial")
+summary(income_tenure_cit_model)
+
+# get predicted probabilities from the model to graph
+cleanData$predicted_prob <- predict(income_tenure_cit_model, type = "response")  
+
+#plot of citizenship status and tenure along with probability of being cost burdened
+ggplot(cleanData, aes(x = as.factor(CIT_BINARY), y = predicted_prob, fill = as.factor(CIT_BINARY))) +  
+  geom_boxplot() +  
+  labs(title = "Predicted Probability of Cost-Burden by Citizenship, Income, and Tenure",
+       x = "Citizenship",
+       y = "Predicted Probability of Being Cost-Burdened",
+       fill = "Citizenship Status") +  
+  scale_x_discrete(labels = c("0" = "Non-Citizen", "1" = "Citizen")) +  
+  scale_fill_manual(values = c("0" = my_orange, "1" = my_green)) +  
+  facet_wrap(~TEN_BINARY) +
+ theme(legend.position = "none")
+
+# get coefficients
+odds_ratio_citizenship <- exp( -4.234e-02 )  
+odds_ratio_income_owner_10k <- exp( -3.949e-05  * 10000)  
+odds_ratio_income_renter_10k <- exp(( -3.949e-05  +  -1.273e-05) * 10000)  
+odds_ratio_tenure <- exp( -1.273e-05)  
+
+cat("Odds change for Citizenship:", odds_ratio_citizenship, "\n")
+cat("Odds change for a $10,000 Increase in Income (Owners):", odds_ratio_income_owner_10k, "\n")
+cat("Odds change for a $10,000 Increase in Income (Renters):", odds_ratio_income_renter_10k, "\n")
+cat("Odds change for Renters:", odds_ratio_tenure, "\n")
+
+
+
+```
+
+This model expands the previous one by introducing citizenship status. Non-citizens may face additional barriers in housing affordability due to employment limitations and lack of financial assistance. A box plot of predicted probability of cost burden across citizenship and tenure shows that non-citizens have a higher probability of being cost-burdened. Renters who are non-citizens are the most vulnerable group. A logistic model shows that renters are only 15.2%  as likely to be cost-burdened as homeowners when controlling for income and citizenship. This reinforces Simpson’s Paradox because without controlling income, renters appear more burdened, but after adjustment, homeowners are more at risk. Additionally, a $10,000 increase in income reduces cost burden odds by 32.6% for homeowners and 40.7% for renters. In contrast to the graph below, citizenship status does not significantly impact cost burden when controlling for income and tenure. Non-citizens appeared less cost-burdened, but the differences in housing tenure and income fully explain that effect.
+
+
+
+#### Tenure and Birth of a Child
+
+```{r}
+# model with FER and TED_BINARY predictors with interaction
+fer_ten_model <- glm(cost_burdened ~ FER + TEN_BINARY + FER:TEN_BINARY, data = cleanData, family = "binomial")
+summary(fer_ten_model)
+
+# get odds ratios
+odds_ratio_homeowner_birth <- exp(-0.43374)  # effect of recent birth of a child on homeowners
+odds_ratio_renter_no_birth <- exp(-1.43746)  # effect of renting without birth of a child
+odds_ratio_renter_birth <- exp(-0.43374 + 0.87856)  # effect of recent birth on renters
+
+
+cat("Odds change for Birth of a Child:", odds_ratio_homeowner_birth, "\n")
+cat("Odds change Recent Birth:", odds_ratio_renter_no_birth, "\n")
+cat("Odds change for Renters:", odds_ratio_renter_birth, "\n")
+
+```
+
+Households with a new child face increased expenses, potentially leading to greater financial strain. An added interaction term is added to account for the potential differing effect of birth on renters and homeowners. A logistic model with an interaction term shows that among homeowners, those with a recent birth are 35% less likely to be cost-burdened compared to homeowners without a recent birth. In contrast, renters with a recent birth are 56% more likely to be cost-burdened compared to renters without a recent birth.
+
+
+#### Number of People, Income, Tenure
+
+```{r}
+
+# model with NP and HINCP and TED_BINARY predictors
+np_income_tenure_model <- glm(cost_burdened ~ NP + HINCP + TEN_BINARY + TEN_BINARY:NP, data = cleanData, family = "binomial")
+summary(np_income_tenure_model)
+
+# get predicted probabilities from the model
+cleanData$predicted_prob <- predict(np_income_tenure_model, type = "response")  
+
+# plot of household size and income colors by predicted cost burdened probability, grouped by tenure
+# capped household size at 8 for better scale in graph
+ggplot(cleanData %>% filter(NP <= 8), aes(x = NP, y = HINCP, color = predicted_prob)) + 
+  geom_point(alpha = 0.3) + 
+  scale_color_gradient(low = my_green, high = my_red) +  
+  labs(title = "Predicted Cost-Burdened Probability by Household Size & Income",
+       x = "Number of People in Household",
+       y = "Household Income",
+       color = "Predicted Cost-Burdened Probability") +  
+  scale_y_continuous(labels = scales::comma) +  
+  facet_wrap(~TEN_BINARY)
+
+
+# get odds ratios
+odds_ratio_household_homeowner <- exp(7.514e-02)  # household size effect for homeowners
+odds_ratio_household_renter <- exp( 7.514e-02 + 5.721e-02)  # household size effect for renters
+
+cat("odds in cost burden per additional household member (Homeowners):", odds_ratio_household_homeowner, "\n")
+cat("odds in cost burden per additional household member (Renters):", odds_ratio_household_renter, "\n")
+
+
+
+```
+
+
+Larger households may experience higher financial strain despite potentially pooling incomes. This model helps determine whether household size independently contributes to cost burden. An interaction term was added to account for potential differing effects of household size in different tenure groups. A logistic model shows that for homeowners, each additional person in the household increases the odds of cost burden by 7.8%. For renters, each additional person increases the odds by 14.1%. A scatterplot of household size vs. predicted cost burden probability shows that as the number of people in the household increases, the predicted cost-burdened probability tends to decrease relative to household income.
+
+
+#### Number of People, Citizenship, Tenure, Birth of a Child
+```{r}
+
+# model with NP and CIT_BINARY and TED_BINARY and FER predictors with NP:FER
+np_cit_ten_birth_model <- glm(cost_burdened ~ HINCP + NP + CIT_BINARY + TEN_BINARY + FER + NP:FER + HINCP:FER, data = cleanData, family = "binomial")
+summary(np_cit_ten_birth_model)
+
+
+# Compute odds ratios for key variables
+odds_ratio_birth <- exp(1.363e+00 )
+odds_ratio_interaction_birth_size <- exp(-1.639e+00) 
+odds_ratio_interaction_income_birth <- exp(9.992e-05 * 1000 )  
+
+cat("Odds ratio for having a child:",odds_ratio_birth, "\n")
+cat("Odds ratio change for interaction (NP:FER):", odds_ratio_interaction_birth_size, "\n")
+cat("Odds ratio change for interaction (HINCP:FER)", odds_ratio_interaction_income_birth, "\n")
+
+
+
+```
+
+Larger households may experience different financial pressures depending on housing tenure, so an interaction term was included to examine whether the effect of household size varies between renters and homeowners. Households in this model that had a child in the past 12 months are 290% more likely to be cost-burdened, reinforcing the financial strain of a new child, however as household size increases, the impact of having a child on cost burden decreases significantly.  Also, for households with a recent birth, a higher income slightly increases cost burden, with each $1,000 increase in income increasing the odds of being cost-burdened by approximately 10.5%.
+
+
+## Selection of Best Multivariate Models
+
+I chose three models to elaborate on based on their AIC values and strong predictive power. The Income & Tenure Model (AIC: 91992) is simple and clear, showing that tenure effects cost-burdened probability and that higher income reduces this burden. The Household Size, Income, & Tenure Model (AIC: 91682) improves upon this slightly by incorporating household size. Lastly, the Household Size, Citizenship, Tenure, & Birth Model (AIC: 90730) had the best overall fit. This model shows that having a child increases financial strain, although the impact is moderated by household size. 
+
+
+#### Income and Tenure
+```{r}
+
+
+# transform income using log 
+cleanData1 <- cleanData %>%
+  mutate(log_HINCP = log(HINCP + 1)) 
+
+# fit the updated model
+income_tenure_model_updated <- glm(cost_burdened ~ log_HINCP + TEN_BINARY, 
+                               family = "binomial", data = cleanData1)
+
+summary(income_tenure_model_updated)
+
+# make predictions for a renter and homeowner at $40,000 income
+test_data <- data.frame(log_HINCP = log(40000 + 1), TEN_BINARY = c("Renter", "Owner"))
+test_data$predicted_prob <- predict(income_tenure_model_updated, newdata = test_data, type = "response")
+test_data
+
+
+#compared r squared value from residual and null deviance
+income_tenure_model_rsquared <- 1-(91990/136400) 
+income_tenure_model_rsquared
+income_tenure_model_updated_rsquared <- 1-(129484/136387)
+income_tenure_model_updated_rsquared
+
+AIC(income_tenure_model, income_tenure_model_updated)
+
+```
+
+The Income & Tenure Model captures the relationship between income, housing tenure, and cost burden. It suggests that income and tenure explain about 32.5% of the variation in cost-burdened status. To improve model fit, I tested a log transformation of income log(HINCP+1) to account for its skewed distribution. However, this resulted in a ~37,000 increase in AIC (from 91,992 to 129,490), indicating a worse model fit. Additionally the updated model can only explain about 5% of the variation in cost-burdened status, decreased by almost 30%.  Using this model to predict cost burden probabilities, a renter earning $40,000 has a 57% probability of being cost-burdened, whereas a homeowner with the same income has a 59% probability. 
+
+
+#### Household Size, Income, and Tenure
+```{r}
+# transform household size using square root
+cleanData1 <- cleanData %>%
+  mutate(sqrt_NP = sqrt(NP))
+
+np_income_tenure_model_updated <- glm(cost_burdened ~ sqrt_NP + HINCP + TEN_BINARY + TEN_BINARY:sqrt_NP, data = cleanData1, family = "binomial")
+summary(np_income_tenure_model)
+
+
+summary(np_income_tenure_model_updated)
+AIC(np_income_tenure_model, np_income_tenure_model_updated)
+
+# predict probability for different household sizes and income levels
+test_data_np <- data.frame(sqrt_NP = sqrt(c(1, 3, 5)), HINCP = c(30000, 50000, 70000), TEN_BINARY = "Renter")
+test_data_np$predicted_prob <- predict(np_income_tenure_model_updated, newdata = test_data_np, type = "response")
+test_data_np
+
+#compared r squared value from residual and null deviance
+np_income_tenure_model_rsquared <- 1-(91672/136387) 
+np_income_tenure_model_rsquared
+np_income_tenure_model_rsquared_updated <- 1-(91606/136387)
+np_income_tenure_model_rsquared_updated
+
+
+
+
+```
+
+This model initially had the lower AIC (91703), indicating a strong fit.  It suggests that income, tenure, and household explain about 32.8% of the variation in cost-burdened status.  I introduced interaction terms between household size and tenure to consider that the effect of household size may differ for renters and owners. While the interaction was not statistically significant, applying a square root transformation to household size (sqrt(NP)) slightly reduced the AIC, suggesting that the relationship is nonlinear. However the R-squared value remains almost identical. Predictions from this model indicate that a renting household with 3 people and a household income of 50,000 has a 56.9% probability of being cost-burdened.
+
+
+#### Income, Household Size, Citizenship, Tenure, Birth of a Child
+```{r}
+#drop citizen
+np_cit_ten_birth_model_updated <- glm(cost_burdened ~ HINCP + NP + TEN_BINARY + FER + NP:FER + HINCP:FER, data = cleanData, family = "binomial")
+
+# some prediction scenarios
+test_data <- data.frame(
+  HINCP = c(30000, 60000, 80000, 30000, 60000, 80000),   
+  NP = c(3, 4, 5, 3, 4, 5),                     
+  TEN_BINARY = c("Renter", "Renter", "Renter", "Owner", "Owner", "Owner"), 
+  FER = c(1, 0, 1, 1, 0, 1))
+
+#  probability of being cost-burdened
+test_data$predicted_prob <- predict(np_cit_ten_birth_model_updated, newdata = test_data, type = "response")
+
+print(test_data)
+
+
+AIC(np_income_tenure_model, np_income_tenure_model_updated)
+
+
+#compared r squared value from residual and null deviance
+np_cit_ten_birth_model_rsquared <- 1-(90714/136387) 
+np_cit_ten_birth_model_rsquared
+np_cit_ten_birth_model_updated_rsquared <- 1-(90725/136387)
+np_cit_ten_birth_model_updated_rsquared
+
+
+
+```
+
+This model provided important demographic insights and also had the lowest AIC out of the models. I tested removing the citizenship status variable since it had the highest p-value in the original model. Dropping the citizen variable led to a small reduction in AIC, confirming that it did not meaningfully contribute to the model.  Additionally, the R-squared value remains the same at 33.4%.When using this model to run predictions on a household with four people, a child born in the past 12 months,  and a household income $60,000, it predicts that if that household rents there is a 15% probability of it being cost-burdened, alternatively if the household owns a home, that probability increases to 29%.
+
+
+## Best Model
+
+#### Model Comparisons
+
+```{r}
+
+# comparing AIC values for original vs. improved models
+AIC(income_tenure_model, income_tenure_model_updated,
+    np_income_tenure_model, np_income_tenure_model_updated,
+    np_cit_ten_birth_model, np_cit_ten_birth_model_updated)
+
+
+```
+
+
+
+#### Final Model and Implications
+Cost Burdened ∼ Income + Household Size + Housing Tenure + Birth of a Child + Birth of a Child:Household Size + Income:Birth of a Child
+
+The above model is the most effective for understanding cost burden dynamics in single-parent households. It shows that larger households tend to moderate the financial impact of a recent birth, but renters with new children remain at high risk. Additionally, tenure plays a role, with homeowners facing a greater likelihood of being cost-burdened at similar income levels.
+
+For practical application, policymakers and housing assistance programs can use this model to identify high-risk households and target support efforts. By inputting household size, income, tenure status, and recent child status, the model can predict the probability of cost burden. For example, if a single-parent homeowner with a household size of three, recent birth of a child, and a $80,000 income is predicted to have a 22.4% chance of being cost-burdened. 
+
+However, these predictions should not be interpreted as definitive outcomes for any individual household as they reflect general trends based on population data. External factors outside the model predictors such as job loss or other fluctuations may significantly impact individual circumstances in ways that the model cannot fully capture. Additionally, while the model helps explain who is most at risk, it does not determine the root causes of cost burden.
+
+
+## Extra Geospatial Analysis
+```{r}
+
+#acs tables -> https://data.census.gov/
+
+
+#----------Rents Maps----------
+
+# define rent variables
+acs_vars <- c(
+  "B25064_001"  # median gross rent
+)
+
+mn_acs <- get_acs(
+  geography = "county",
+  variables = acs_vars,
+  state = "MN",
+  year = 2023,
+  survey = "acs5",
+  geometry = TRUE
+)
+
+# wide format for better graphing
+mn_acs_wide <- mn_acs %>%
+  select(GEOID, NAME, variable, estimate, geometry) %>%
+  pivot_wider(names_from = variable, values_from = estimate)
+
+# renaming variables for better reading
+mn_acs_wide <- mn_acs_wide %>%
+  mutate(
+    median_rent = B25064_001,
+  )
+
+# map median rent by county
+ggplot(mn_acs_wide) +
+  geom_sf(aes(fill = median_rent), color = "white", size = 0.2) +
+  scale_fill_gradientn(
+    colors = c(my_green, my_orange, my_red),
+    limits = c(NA, 2000), # max chosen by hand
+    labels = scales::dollar
+  ) +
+  labs(
+    title = "Median Monthly Rent by County in Minnesota",
+    fill = "Median Rent"
+  ) 
+
+
+
+#----------Mortgage Maps----------
+
+# define mortgage variables
+acs_vars <- c(
+  median_mortgage = "B25088_002" # median mortgage rent
+)
+
+# get ACS mortgage data
+mn_acs <- get_acs(
+  geography = "county",
+  variables = acs_vars,
+  state = "MN",
+  year = 2023,
+  survey = "acs5",
+  geometry = TRUE
+)
+
+
+# wide format for graphing
+mn_acs_wide <- mn_acs %>%
+  select(GEOID, NAME, variable, estimate, geometry) %>%
+  pivot_wider(names_from = variable, values_from = estimate)
+
+# map median mortgage by county
+ggplot(mn_acs_wide) +
+  geom_sf(aes(fill = median_mortgage), color = "white", size = 0.2) +
+  scale_fill_gradientn(
+    colors = c(my_green, my_orange, my_red), 
+    limits = c(NA, 2500), # max chosen by hand
+    oob = scales::squish,  # distort to keep outliers as values and not NA
+    labels = scales::comma
+  ) +
+  labs(
+    title = "Median Monthly Mortgage by County in Minnesota",
+    fill = "Median Mortgage"
+  ) 
+
+
+
+
+```
